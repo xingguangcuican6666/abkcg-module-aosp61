@@ -18,9 +18,21 @@
 #include <linux/nsproxy.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/task.h>
+#include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/version.h>
+
+#ifdef CONFIG_SECURITY_SELINUX
+#include "../security/selinux/include/security.h"
+#include "../security/selinux/include/xfrm.h"
+#include "../security/selinux/ss/avtab.h"
+#include "../security/selinux/ss/hashtab.h"
+#include "../security/selinux/ss/policydb.h"
+#include "../security/selinux/ss/services.h"
+#include "../security/selinux/ss/symtab.h"
+#endif
 
 #define ABKCG_HASH_BITS 8
 
@@ -43,6 +55,250 @@ static struct kobject *abkcg_kobj;
 
 static DEFINE_MUTEX(abkcg_groups_lock);
 static DEFINE_HASHTABLE(abkcg_groups, ABKCG_HASH_BITS);
+
+#ifdef CONFIG_SECURITY_SELINUX
+#define ABKCG_SEPOL_MAX_TOKENS 5
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+#define abkcg_symtab_search(s, name) symtab_search((s), (name))
+#else
+#define abkcg_symtab_search(s, name) hashtab_search((s)->table, (name))
+#endif
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+extern int avc_ss_reset(u32 seqno);
+#else
+extern int avc_ss_reset(struct selinux_avc *avc, u32 seqno);
+#endif
+
+static void abkcg_reset_avc_cache(void)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+	avc_ss_reset(0);
+	selnl_notify_policyload(0);
+	selinux_status_update_policyload(0);
+#else
+	struct selinux_avc *avc = selinux_state.avc;
+
+	avc_ss_reset(avc, 0);
+	selnl_notify_policyload(0);
+	selinux_status_update_policyload(&selinux_state, 0);
+#endif
+	selinux_xfrm_notify_policyload();
+}
+
+static struct avtab_node *abkcg_get_avtab_node(struct policydb *db,
+					       const struct avtab_key *src_key)
+{
+	struct avtab_key key = *src_key;
+	struct avtab_node *node;
+	struct avtab_datum avdatum = {
+		.u.data = key.specified == AVTAB_AUDITDENY ? ~0U : 0U,
+	};
+
+	node = avtab_search_node(&db->te_avtab, &key);
+	if (node)
+		return node;
+
+	node = avtab_insert_nonunique(&db->te_avtab, &key, &avdatum);
+	if (!node)
+		return NULL;
+
+	db->len += sizeof(struct avtab_key) + sizeof(struct avtab_datum);
+	return node;
+}
+
+static bool abkcg_add_allow_rule(struct policydb *db, const char *src_name,
+				 const char *tgt_name, const char *cls_name,
+				 const char *perm_name)
+{
+	struct type_datum *src;
+	struct type_datum *tgt;
+	struct class_datum *cls;
+	struct perm_datum *perm = NULL;
+	struct avtab_key key;
+	struct avtab_node *node;
+
+	src = abkcg_symtab_search(&db->p_types, src_name);
+	tgt = abkcg_symtab_search(&db->p_types, tgt_name);
+	cls = abkcg_symtab_search(&db->p_classes, cls_name);
+	if (!src || !tgt || !cls)
+		return false;
+
+	if (perm_name) {
+		perm = abkcg_symtab_search(&cls->permissions, perm_name);
+		if (!perm && cls->comdatum)
+			perm = abkcg_symtab_search(&cls->comdatum->permissions, perm_name);
+		if (!perm)
+			return false;
+	}
+
+	key.source_type = src->value;
+	key.target_type = tgt->value;
+	key.target_class = cls->value;
+	key.specified = AVTAB_ALLOWED;
+
+	node = abkcg_get_avtab_node(db, &key);
+	if (!node)
+		return false;
+
+	if (perm)
+		node->datum.u.data |= 1U << (perm->value - 1);
+	else
+		node->datum.u.data = ~0U;
+	return true;
+}
+
+static bool abkcg_set_permissive(struct policydb *db, const char *type_name)
+{
+	struct type_datum *type;
+
+	type = abkcg_symtab_search(&db->p_types, type_name);
+	if (!type)
+		return false;
+
+	return ebitmap_set_bit(&db->permissive_map, type->value, 1) == 0;
+}
+
+static struct selinux_policy *abkcg_dup_sepolicy(struct selinux_policy *old_pol)
+{
+	int ret;
+	size_t len;
+	struct selinux_policy *new_pol;
+	void *data;
+	struct policy_file fp;
+
+	len = old_pol->policydb.len;
+	data = vmalloc(len);
+	if (!data)
+		return ERR_PTR(-ENOMEM);
+
+	fp.data = data;
+	fp.len = len;
+	ret = policydb_write(&old_pol->policydb, &fp);
+	if (ret) {
+		kvfree(data);
+		return ERR_PTR(ret);
+	}
+
+	new_pol = kmemdup(old_pol, sizeof(*old_pol), GFP_KERNEL);
+	if (!new_pol) {
+		kvfree(data);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	memset(&new_pol->policydb, 0, sizeof(new_pol->policydb));
+	fp.data = data;
+	fp.len = len;
+	ret = policydb_read(&new_pol->policydb, &fp);
+	kvfree(data);
+	if (ret) {
+		kfree(new_pol);
+		return ERR_PTR(ret);
+	}
+
+	new_pol->policydb.len = old_pol->policydb.len;
+	return new_pol;
+}
+
+static void abkcg_destroy_sepolicy(struct selinux_policy *pol)
+{
+	policydb_destroy(&pol->policydb);
+	kfree(pol);
+}
+
+static int abkcg_apply_sepolicy_tokens(char **argv, int argc)
+{
+	struct selinux_policy *old_pol, *pol;
+	struct policydb *db;
+	int ret = -EINVAL;
+
+	mutex_lock(&selinux_state.policy_mutex);
+	old_pol = rcu_dereference_protected(selinux_state.policy,
+					    lockdep_is_held(&selinux_state.policy_mutex));
+	pol = abkcg_dup_sepolicy(old_pol);
+	if (IS_ERR(pol)) {
+		ret = PTR_ERR(pol);
+		goto out_unlock;
+	}
+
+	db = &pol->policydb;
+	if (!strcmp(argv[0], "permissive")) {
+		if (argc != 2) {
+			ret = -EINVAL;
+			goto out_drop_policy;
+		}
+		ret = abkcg_set_permissive(db, argv[1]) ? 0 : -EINVAL;
+	} else if (!strcmp(argv[0], "allow")) {
+		if (argc != 5) {
+			ret = -EINVAL;
+			goto out_drop_policy;
+		}
+		ret = abkcg_add_allow_rule(db, argv[1], argv[2], argv[3],
+					   !strcmp(argv[4], "*") ? NULL : argv[4]) ? 0 : -EINVAL;
+	} else if (!strcmp(argv[0], "ksu-abkcg")) {
+		ret = 0;
+		ret |= abkcg_set_permissive(db, "ksu") ? 0 : -EINVAL;
+		ret |= abkcg_add_allow_rule(db, "ksu", "cgroup", "dir", NULL) ? 0 : -EINVAL;
+		ret |= abkcg_add_allow_rule(db, "ksu", "cgroup", "file", NULL) ? 0 : -EINVAL;
+		ret |= abkcg_add_allow_rule(db, "ksu", "cgroup", "lnk_file", NULL) ? 0 : -EINVAL;
+	} else {
+		ret = -EINVAL;
+	}
+
+	if (ret)
+		goto out_drop_policy;
+
+	rcu_assign_pointer(selinux_state.policy, pol);
+	synchronize_rcu();
+	abkcg_destroy_sepolicy(old_pol);
+	abkcg_reset_avc_cache();
+	goto out_unlock;
+
+out_drop_policy:
+	abkcg_destroy_sepolicy(pol);
+out_unlock:
+	mutex_unlock(&selinux_state.policy_mutex);
+	return ret;
+}
+
+ssize_t abkcg_sepolicy_apply_cmd(const char *buf, size_t size)
+{
+	char *tmp, *cursor, *tok;
+	char *argv[ABKCG_SEPOL_MAX_TOKENS];
+	int argc = 0;
+	int ret;
+
+	tmp = kmemdup_nul(buf, size, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	cursor = strim(tmp);
+	while ((tok = strsep(&cursor, " \t\n"))) {
+		if (!*tok)
+			continue;
+		if (argc >= ABKCG_SEPOL_MAX_TOKENS) {
+			kfree(tmp);
+			return -E2BIG;
+		}
+		argv[argc++] = tok;
+	}
+
+	if (!argc) {
+		kfree(tmp);
+		return -EINVAL;
+	}
+
+	ret = abkcg_apply_sepolicy_tokens(argv, argc);
+	kfree(tmp);
+	return ret ? ret : (ssize_t)size;
+}
+#else
+ssize_t abkcg_sepolicy_apply_cmd(const char *buf, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 static struct abkcg_group_state *abkcg_state_lookup(struct cgroup *cgrp)
 {
@@ -716,16 +972,24 @@ static ssize_t reset_store(struct kobject *kobj, struct kobj_attribute *attr,
 	return count;
 }
 
+static ssize_t sepolicy_store(struct kobject *kobj, struct kobj_attribute *attr,
+			      const char *buf, size_t count)
+{
+	return abkcg_sepolicy_apply_cmd(buf, count);
+}
+
 static struct kobj_attribute enabled_attr = __ATTR_RW(enabled);
 static struct kobj_attribute mounts_attr = __ATTR_RO(mounts);
 static struct kobj_attribute groups_attr = __ATTR_RO(groups);
 static struct kobj_attribute reset_attr = __ATTR_WO(reset);
+static struct kobj_attribute sepolicy_attr = __ATTR_WO(sepolicy);
 
 static struct attribute *abkcg_attrs[] = {
 	&enabled_attr.attr,
 	&mounts_attr.attr,
 	&groups_attr.attr,
 	&reset_attr.attr,
+	&sepolicy_attr.attr,
 	NULL,
 };
 

@@ -18,3 +18,15 @@ Design constraints:
 This module only changes the module directory itself. The kernel tree is
 modified later by running `setup.sh` with `KERNEL_ROOT` pointing at the AOSP
 kernel source.
+
+Testing notes:
+
+- `abkcg2fs` should be mounted on top of a real cgroup2 tree such as
+  `/sys/fs/cgroup`.
+- when SELinux is enabled, `/sys/kernel/abkcg/sepolicy` accepts minimal live
+  test commands inspired by KernelSU's policy patch flow:
+  - `ksu-abkcg`
+  - `permissive <domain>`
+  - `allow <src> <tgt> <class> <perm|*>`
+- this interface is intended only to unblock ABKCG test flows that would
+  otherwise hit AVC denials during cgroup directory or control-file access.

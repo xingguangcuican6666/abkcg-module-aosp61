@@ -69,6 +69,7 @@ ssize_t abkcg_read_file(struct cgroup *cgrp, const char *name,
 			char *buf, size_t size, loff_t *ppos);
 ssize_t abkcg_write_file(struct cgroup *cgrp, const char *name,
 			 const char *buf, size_t size);
+ssize_t abkcg_sepolicy_apply_cmd(const char *buf, size_t size);
 
 #else
 
@@ -174,6 +175,11 @@ static inline ssize_t abkcg_read_file(struct cgroup *cgrp, const char *name,
 
 static inline ssize_t abkcg_write_file(struct cgroup *cgrp, const char *name,
 				       const char *buf, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline ssize_t abkcg_sepolicy_apply_cmd(const char *buf, size_t size)
 {
 	return -EOPNOTSUPP;
 }

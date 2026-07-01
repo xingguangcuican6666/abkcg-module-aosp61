@@ -46,7 +46,7 @@ def patch_init_kconfig(path: Path) -> None:
     replace_once(
         path,
         "config CGROUP_RDMA\n",
-        'config ABK_CGROUP\n\tbool "ABK cgroup2 shadow pids/devices view"\n\tdepends on CGROUPS && SYSFS\n\tdefault n\n\thelp\n\t  Build the ABK shadow cgroup layer and the abkcg2fs cgroup2 view\n\t  filesystem. This keeps native pids/devices controllers disabled while\n\t  exposing ABK-backed pids.* and devices.* files in a separate view.\n\nconfig CGROUP_RDMA\n',
+        'config ABK_CGROUP\n\tbool "ABK cgroup2 shadow pids/devices view"\n\tdepends on CGROUPS && SYSFS\n\tselect SECURITY_SELINUX_AVC_STATS if SECURITY_SELINUX\n\tdefault n\n\thelp\n\t  Build the ABK shadow cgroup layer and the abkcg2fs cgroup2 view\n\t  filesystem. This keeps native pids/devices controllers disabled while\n\t  exposing ABK-backed pids.* and devices.* files in a separate view.\n\t  When SELinux is enabled, ABK also exposes a minimal live policy patch\n\t  control used to relax AVC checks for test domains.\n\nconfig CGROUP_RDMA\n',
         "init_kconfig",
     )
 
