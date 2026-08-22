@@ -35,11 +35,29 @@ def patch_fs_makefile(path: Path) -> None:
 
 
 def patch_kernel_makefile(path: Path) -> None:
+    object_rule = "obj-$(CONFIG_ABK_CGROUP) += abkcg_core.o\n"
+    selinux_include_flags = (
+        "CFLAGS_abkcg_core.o += -I$(srctree)/security/selinux "
+        "-I$(srctree)/security/selinux/include "
+        "-I$(objtree)/security/selinux "
+        "-I$(objtree)/security/selinux/include\n"
+    )
+    selinux_generated_headers = (
+        "$(obj)/abkcg_core.o: $(objtree)/security/selinux/flask.h "
+        "$(objtree)/security/selinux/av_permissions.h\n"
+    )
+
     ensure_after(
         path,
         "obj-$(CONFIG_CGROUPS) += cgroup/\n",
-        "obj-$(CONFIG_ABK_CGROUP) += abkcg_core.o\n",
+        object_rule,
         "kernel_makefile",
+    )
+    ensure_after(
+        path,
+        object_rule,
+        selinux_include_flags + selinux_generated_headers,
+        "kernel_makefile_selinux_headers",
     )
 
 def patch_init_kconfig(path: Path) -> None:
